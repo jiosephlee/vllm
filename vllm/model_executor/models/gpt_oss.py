@@ -1074,6 +1074,16 @@ class GptOssModel(nn.Module):
         return loaded_params
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        def _map_weights(w_iter):
+            for name, param in w_iter:
+                if "gate_up_proj" in name:
+                    name = name.replace("gate_up_proj", "w13_weight")
+                elif "down_proj" in name:
+                    name = name.replace("down_proj", "w2_weight")
+                yield name, param
+        
+        weights = _map_weights(weights)
+
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
