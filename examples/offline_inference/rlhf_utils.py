@@ -57,62 +57,7 @@ class WorkerExtension:
             weight, src=0, stream=torch.cuda.current_stream()
         )
 
-        try:
-            self.model_runner.model.load_weights(weights=[(name, weight)])
-        except TypeError as e:
-            if "unexpected keyword argument" not in str(e):
-                raise
-            if not getattr(self, "_fallback_warned", False):
-                print(f"[WorkerExtension] load_weights TypeError workaround activated: {e}")
-                self._fallback_warned = True
-            
-            # Prepare state_dict cache
-            if getattr(self, "_param_cache", None) is None:
-                self._param_cache = dict(self.model_runner.model.named_parameters())
-            state_dict = self._param_cache
-
-            mapped_name = name
-            if hasattr(self.model_runner.model, "hf_to_vllm_mapper"):
-                mapper = self.model_runner.model.hf_to_vllm_mapper
-                if hasattr(mapper, "_mappings"):
-                    import re
-                    for hf_pattern, vllm_pattern in mapper._mappings.items():
-                        if isinstance(hf_pattern, re.Pattern):
-                            match = hf_pattern.match(name)
-                            if match:
-                                if callable(vllm_pattern):
-                                    res = vllm_pattern(match)
-                                    if res:
-                                        mapped_name = res
-                                else:
-                                    mapped_name = hf_pattern.sub(vllm_pattern, name)
-                                break
-                        elif hf_pattern == name:
-                            mapped_name = vllm_pattern
-                            break
-            
-            if mapped_name == name:
-                if "gate_up_proj" in name:
-                    mapped_name = name.replace("gate_up_proj", "w13_weight")
-                elif "down_proj" in name:
-                    mapped_name = name.replace("down_proj", "w2_weight")
-
-            mapped_name = str(mapped_name)
-
-            if mapped_name in state_dict:
-                state_dict[mapped_name].data.copy_(weight)
-            elif mapped_name + ".weight" in state_dict:
-                state_dict[mapped_name + ".weight"].data.copy_(weight)
-            else:
-                matched = False
-                for k, param in state_dict.items():
-                    if k.endswith(mapped_name) or mapped_name.endswith(k) or k.replace(".weight", "") == mapped_name:
-                        param.data.copy_(weight)
-                        state_dict[mapped_name] = param
-                        matched = True
-                        break
-                if not matched:
-                    raise KeyError(f"Failed to find parameter {mapped_name} (original: {name}) for fallback. Available: {list(state_dict)[:5]}...")
+        self.model_runner.model.load_weights(weights=[(name, weight)])
 
         del weight
 
@@ -197,62 +142,10 @@ class ColocateWorkerExtension:
                 size = dtype.itemsize * shape.numel()
                 tensor = buffer[offset : offset + size].view(dtype=dtype).view(shape)
                 weights.append((item["name"], tensor))
-            try:
-                self.model_runner.model.load_weights(weights=weights)
-            except TypeError as e:
-                if "unexpected keyword argument" not in str(e):
-                    raise
-                if not getattr(self, "_fallback_warned", False):
-                    print(f"[ColocateWorkerExtension] load_weights TypeError workaround activated for batched weights: {e}")
-                    self._fallback_warned = True
-                
-                if getattr(self, "_param_cache", None) is None:
-                    self._param_cache = dict(self.model_runner.model.named_parameters())
-                state_dict = self._param_cache
-
-                mapper = getattr(self.model_runner.model, "hf_to_vllm_mapper", None)
-
-                for name, weight_tensor in weights:
-                    mapped_name = name
-                    if mapper and hasattr(mapper, "_mappings"):
-                        import re
-                        for hf_pattern, vllm_pattern in mapper._mappings.items():
-                            if isinstance(hf_pattern, re.Pattern):
-                                match = hf_pattern.match(name)
-                                if match:
-                                    if callable(vllm_pattern):
-                                        res = vllm_pattern(match)
-                                        if res:
-                                            mapped_name = res
-                                    else:
-                                        mapped_name = hf_pattern.sub(vllm_pattern, name)
-                                    break
-                            elif hf_pattern == name:
-                                mapped_name = vllm_pattern
-                                break
-                                
-                    if mapped_name == name:
-                        if "gate_up_proj" in name:
-                            mapped_name = name.replace("gate_up_proj", "w13_weight")
-                        elif "down_proj" in name:
-                            mapped_name = name.replace("down_proj", "w2_weight")
-
-                    mapped_name = str(mapped_name)
-
-                    if mapped_name in state_dict:
-                        state_dict[mapped_name].data.copy_(weight_tensor)
-                    elif mapped_name + ".weight" in state_dict:
-                        state_dict[mapped_name + ".weight"].data.copy_(weight_tensor)
-                    else:
-                        matched = False
-                        for k, param in state_dict.items():
-                            if k.endswith(mapped_name) or mapped_name.endswith(k) or k.replace(".weight", "") == mapped_name:
-                                param.data.copy_(weight_tensor)
-                                state_dict[mapped_name] = param
-                                matched = True
-                                break
-                        if not matched:
-                            raise KeyError(f"Failed to find parameter {mapped_name} (original: {name}) for fallback. Available: {list(state_dict)[:5]}...")
+            self.model_runner.model.load_weights(weights=weights)
+            del weights
+            torch.cuda.synchronize()
+            socket.send(b"")
 
         socket.close()
         del buffer
