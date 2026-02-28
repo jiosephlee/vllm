@@ -156,6 +156,10 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
         if info.load_numel >= info.load_numel_total and not isinstance(  # type: ignore[operator]
             layer, (Attention, MLAAttention)
         ):
+            print(f"[DEBUG online_process_loader] All weights loaded for "
+                  f"{layer.__class__.__name__}: "
+                  f"{info.load_numel}/{info.load_numel_total} numel, "
+                  f"{len(info.loaded_weights)} cached weight entries → processing")
             _layerwise_process(layer, info)
 
         return ret
@@ -174,6 +178,7 @@ def finalize_layerwise_reload(model: torch.nn.Module, model_config: ModelConfig)
     """
     model._do_torchao_reload = model._original_do_torchao_reload
 
+    _finalize_stats = {"attention": 0, "no_weights": 0, "delayed": 0, "already_done": 0}
     for layer in model.modules():
         info = get_layerwise_info(layer)
 
@@ -187,20 +192,29 @@ def finalize_layerwise_reload(model: torch.nn.Module, model_config: ModelConfig)
             else:
                 _place_kernel_tensors(layer, info)
                 layer.process_weights_after_loading(model_config.dtype)
+                _finalize_stats["attention"] += 1
 
         # No weights were loaded, place kernel tensors back
         elif info.can_process() and info.load_numel <= 0:
             _place_kernel_tensors(layer, info)
+            _finalize_stats["no_weights"] += 1
 
         # Process non-attention layers which did not load all elements. This can happen
         # if the created weight has extra padding elements which are not loaded
         # Having too many of these delayed layers can lead to execess memory usage
         # see Limitations(4)
         elif info.load_numel > 0 and info.load_numel < info.load_numel_total:  # type: ignore[operator]
+            print(f"[DEBUG finalize] Delayed processing: {layer.__class__.__name__} "
+                  f"({info.load_numel}/{info.load_numel_total} numel)")
             logger.debug("%s: Delayed processing", layer.__class__.__name__)
             _layerwise_process(layer, info)
+            _finalize_stats["delayed"] += 1
+        else:
+            _finalize_stats["already_done"] += 1
 
         info.reset()
+
+    print(f"[DEBUG finalize_layerwise_reload] Stats: {_finalize_stats}")
 
 
 def _layerwise_process(layer: torch.nn.Module, info: LayerReloadingInfo):
@@ -235,15 +249,26 @@ def _layerwise_process(layer: torch.nn.Module, info: LayerReloadingInfo):
     # Attention/MLA are processed in `finalize_layerwise_reload`
     quant_method = getattr(layer, "quant_method", None)
     if isinstance(quant_method, QuantizeMethodBase):
+        print(f"[DEBUG _layerwise_process] Running process_weights_after_loading on "
+              f"{layer.__class__.__name__} (quant_method={quant_method.__class__.__name__})")
         quant_method.process_weights_after_loading(layer)
+    else:
+        print(f"[DEBUG _layerwise_process] NO quant_method on {layer.__class__.__name__} "
+              f"(quant_method={quant_method}), loaded_weights={len(info.loaded_weights)}")
 
     # Copy processed values into original tensor storage (preserves cudagraph refs)
     # this code is a no-op if not reloading (because kernel tensors is empty)
     parameters, buffers = info.kernel_tensors
+    _kernel_count = 0
     for name, param in parameters.items():
         param.data.copy_(getattr(layer, name))
+        _kernel_count += 1
     for name, buffer in buffers.items():
         buffer.data.copy_(getattr(layer, name))
+        _kernel_count += 1
+    if _kernel_count == 0:
+        print(f"[DEBUG _layerwise_process] WARNING: 0 kernel tensors to copy back "
+              f"for {layer.__class__.__name__}")
 
     _place_kernel_tensors(layer, info)
 
