@@ -410,6 +410,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
+        # Save weight_loader before any backend replaces Parameter objects.
+        # Some backends (FlashInfer) create fresh Parameters, losing the
+        # weight_loader attribute that FusedMoE.create_weights() set via
+        # set_weight_attrs().  We re-apply it at the end of this method.
+        _saved_weight_loader = getattr(
+            layer.w13_weight, "weight_loader", None
+        )
+
         if self.mxfp4_backend == Mxfp4Backend.MARLIN:
             prepare_moe_fp4_layer_for_marlin(
                 layer, input_dtype=get_marlin_input_dtype()
@@ -817,6 +825,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 f"Unsupported mxfp4_backend: {self.mxfp4_backend}: "
                 f"should be one of: {list(Mxfp4Backend)}."
             )
+
+        # Re-apply weight_loader on any Parameters that were replaced above.
+        # Without this, subsequent load_weights() calls (e.g. RLHF weight
+        # sync) fall back to default_weight_loader which doesn't handle the
+        # padded-narrowing that FusedMoE.weight_loader provides for MXFP4.
+        if _saved_weight_loader is not None:
+            for attr in ("w13_weight", "w13_weight_scale", "w13_bias",
+                         "w2_weight", "w2_weight_scale", "w2_bias"):
+                param = getattr(layer, attr, None)
+                if param is not None and not hasattr(param, "weight_loader"):
+                    param.weight_loader = _saved_weight_loader
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
