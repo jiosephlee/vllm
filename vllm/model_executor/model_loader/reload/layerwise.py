@@ -224,6 +224,17 @@ def _layerwise_process(layer: torch.nn.Module, info: LayerReloadingInfo):
     # Materialize layer tensors onto device
     materialize_layer(layer)
 
+    # Zero-fill materialized tensors to prevent uninitialized padding from
+    # contaminating process_weights_after_loading.  FusedMoE parameters have
+    # padding beyond the loaded region (e.g. w13_bias [32,6144] but only 5760
+    # loaded).  Mxfp4MoEMethod.process_weights_after_loading shuffles the
+    # *full* tensor via permute indices, scattering garbage NaN/Inf from
+    # padding into valid positions.  Zero-filling is safe because all valid
+    # data is overwritten by the cached weight loading step below.
+    for tensor in get_layer_tensors(layer).values():
+        if tensor.device.type != "meta":
+            tensor.data.zero_()
+
     # Reset FP8 online quantization flag so process_weights_after_loading
     # will run again during reload
     if hasattr(layer, "_already_called_process_weights_after_loading"):
