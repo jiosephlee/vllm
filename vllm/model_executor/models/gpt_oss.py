@@ -370,19 +370,31 @@ class GptOssModel(nn.Module):
             # Debug: log each weight being loaded (first few + all layer 0)
             _debug_count += 1
             if _debug_count <= 3 or "layers.0." in name:
-                _matched = "w13_weight_scale" if ".w13_weight_scale" in name else \
-                           "w2_weight_scale" if ".w2_weight_scale" in name else \
-                           "w13_weight" if ".w13_weight" in name else \
-                           "w2_weight" if ".w2_weight" in name else \
-                           "w13_bias" if ".w13_bias" in name else \
-                           "w2_bias" if ".w2_bias" in name else \
-                           "sinks" if "sinks" in name else \
-                           "qkv_stacked" if any(w in name for _, w, _ in stacked_params_mapping) else \
-                           "other"
-                print(f"[DEBUG _load_weights_mxfp4] #{_debug_count} name={name} "
-                      f"shape={list(weight.shape)} dtype={weight.dtype} "
-                      f"matched={_matched} "
-                      f"in_params_dict={name in params_dict}")
+                _matched = (
+                    "w13_weight_scale"
+                    if ".w13_weight_scale" in name
+                    else "w2_weight_scale"
+                    if ".w2_weight_scale" in name
+                    else "w13_weight"
+                    if ".w13_weight" in name
+                    else "w2_weight"
+                    if ".w2_weight" in name
+                    else "w13_bias"
+                    if ".w13_bias" in name
+                    else "w2_bias"
+                    if ".w2_bias" in name
+                    else "sinks"
+                    if "sinks" in name
+                    else "qkv_stacked"
+                    if any(w in name for _, w, _ in stacked_params_mapping)
+                    else "other"
+                )
+                print(
+                    f"[DEBUG _load_weights_mxfp4] #{_debug_count} name={name} "
+                    f"shape={list(weight.shape)} dtype={weight.dtype} "
+                    f"matched={_matched} "
+                    f"in_params_dict={name in params_dict}"
+                )
 
             if ".w13_weight_scale" in name:
                 # Handle MLP gate and up projection weights scale
@@ -1015,6 +1027,9 @@ class GptOssModel(nn.Module):
 
             if ".w13_weight" in name:
                 # Handle MLP gate and up projection weights
+                # Backward compat: flatten 4D [E, out, nblk, bsz//2] → 3D
+                if weight.ndim == 4:
+                    weight = weight.reshape(weight.shape[0], weight.shape[1], -1)
                 # Extract gate and up projection parts
                 if use_ep:
                     narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
@@ -1029,6 +1044,9 @@ class GptOssModel(nn.Module):
                 continue
             elif ".w2_weight" in name:
                 # Handle MLP down projection weights
+                # Backward compat: flatten 4D → 3D
+                if weight.ndim == 4:
+                    weight = weight.reshape(weight.shape[0], weight.shape[1], -1)
                 if use_ep:
                     narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
                 else:
@@ -1099,7 +1117,7 @@ class GptOssModel(nn.Module):
                 elif "down_proj" in name:
                     name = name.replace("down_proj", "w2_weight")
                 yield name, param
-        
+
         weights = _map_weights(weights)
 
         stacked_params_mapping = [
@@ -1129,9 +1147,13 @@ class GptOssModel(nn.Module):
             else None
         )
 
-        if quant_method == "mxfp4" and not getattr(self, "_debug_load_weights_logged", False):
-            print(f"[DEBUG GptOssModel.load_weights] quant_method={quant_method}, "
-                  f"tp_size={tp_size}, tp_rank={tp_rank}, ep_size={ep_size}, ep_rank={ep_rank}")
+        if quant_method == "mxfp4" and not getattr(
+            self, "_debug_load_weights_logged", False
+        ):
+            print(
+                f"[DEBUG GptOssModel.load_weights] quant_method={quant_method}, "
+                f"tp_size={tp_size}, tp_rank={tp_rank}, ep_size={ep_size}, ep_rank={ep_rank}"
+            )
             self._debug_load_weights_logged = True
 
         if quant_method == "mxfp4":
