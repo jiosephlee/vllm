@@ -96,7 +96,7 @@ from vllm.model_executor.parameter import (
     ModelWeightParameter,
     PerTensorScaleParameter,
 )
-from vllm.model_executor.utils import replace_parameter
+from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
