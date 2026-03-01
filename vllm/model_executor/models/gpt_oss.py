@@ -1129,9 +1129,8 @@ class GptOssModel(nn.Module):
             else None
         )
 
-        if not getattr(self, "_debug_load_weights_logged", False):
+        if quant_method == "mxfp4" and not getattr(self, "_debug_load_weights_logged", False):
             print(f"[DEBUG GptOssModel.load_weights] quant_method={quant_method}, "
-                  f"has_quantization_config={hasattr(self.config, 'quantization_config')}, "
                   f"tp_size={tp_size}, tp_rank={tp_rank}, ep_size={ep_size}, ep_rank={ep_rank}")
             self._debug_load_weights_logged = True
 

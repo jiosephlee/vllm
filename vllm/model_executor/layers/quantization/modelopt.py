@@ -1387,6 +1387,29 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
+        if self.moe.has_bias:
+            w13_bias_shape = (
+                (num_experts, 2 * intermediate_size_per_partition)
+                if self.moe.is_act_and_mul
+                else (num_experts, intermediate_size_per_partition)
+            )
+            w13_bias = torch.nn.Parameter(
+                torch.empty(w13_bias_shape, dtype=params_dtype),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_bias", w13_bias)
+            set_weight_attrs(w13_bias, extra_weight_attrs)
+
+            w2_bias = torch.nn.Parameter(
+                torch.empty((num_experts, hidden_size), dtype=params_dtype),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_bias", w2_bias)
+            set_weight_attrs(w2_bias, extra_weight_attrs)
+        else:
+            layer.w13_bias = None
+            layer.w2_bias = None
+
     def process_weights_after_loading(self, layer: FusedMoE) -> None:
         """
         Convert NVFP4 MoE weights into kernel format and setup the kernel.
@@ -1487,6 +1510,8 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             w2_scale_2=layer.w2_weight_scale_2,
             a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
+            w13_bias=getattr(layer, "w13_bias", None),
+            w2_bias=getattr(layer, "w2_bias", None),
         )
 
     @property

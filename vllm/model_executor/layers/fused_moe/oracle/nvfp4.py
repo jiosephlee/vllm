@@ -366,6 +366,8 @@ def make_nvfp4_moe_quant_config(
     w2_scale_2: torch.Tensor,
     a13_scale: torch.Tensor,
     a2_scale: torch.Tensor,
+    w13_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
 ) -> FusedMoEQuantConfig | None:
     UNSUPPORTED = [NvFp4MoeBackend.FLASHINFER_TRTLLM]
     if backend in UNSUPPORTED:
@@ -377,6 +379,8 @@ def make_nvfp4_moe_quant_config(
             g2_alphas=w2_scale_2,
             w1_scale=w13_scale,
             w2_scale=w2_scale,
+            w1_bias=w13_bias,
+            w2_bias=w2_bias,
         )
 
     g1_alphas = a13_scale * w13_scale_2
@@ -388,6 +392,8 @@ def make_nvfp4_moe_quant_config(
         a2_gscale=(1.0 / a2_scale),
         w1_scale=w13_scale,
         w2_scale=w2_scale,
+        w1_bias=w13_bias,
+        w2_bias=w2_bias,
     )
 
 
