@@ -361,40 +361,10 @@ class GptOssModel(nn.Module):
         tp_rank_start = tp_rank * per_rank_intermediate_size
         tp_rank_end = min((tp_rank + 1) * per_rank_intermediate_size, intermediate_size)
 
-        _debug_count = 0
         for name, weight in weights:
             # Skip layers on other devices.
             if is_pp_missing_parameter(name, self):
                 continue
-
-            # Debug: log each weight being loaded (first few + all layer 0)
-            _debug_count += 1
-            if _debug_count <= 3 or "layers.0." in name:
-                _matched = (
-                    "w13_weight_scale"
-                    if ".w13_weight_scale" in name
-                    else "w2_weight_scale"
-                    if ".w2_weight_scale" in name
-                    else "w13_weight"
-                    if ".w13_weight" in name
-                    else "w2_weight"
-                    if ".w2_weight" in name
-                    else "w13_bias"
-                    if ".w13_bias" in name
-                    else "w2_bias"
-                    if ".w2_bias" in name
-                    else "sinks"
-                    if "sinks" in name
-                    else "qkv_stacked"
-                    if any(w in name for _, w, _ in stacked_params_mapping)
-                    else "other"
-                )
-                print(
-                    f"[DEBUG _load_weights_mxfp4] #{_debug_count} name={name} "
-                    f"shape={list(weight.shape)} dtype={weight.dtype} "
-                    f"matched={_matched} "
-                    f"in_params_dict={name in params_dict}"
-                )
 
             if ".w13_weight_scale" in name:
                 # Handle MLP gate and up projection weights scale
@@ -1146,15 +1116,6 @@ class GptOssModel(nn.Module):
             if hasattr(self.config, "quantization_config")
             else None
         )
-
-        if quant_method == "mxfp4" and not getattr(
-            self, "_debug_load_weights_logged", False
-        ):
-            print(
-                f"[DEBUG GptOssModel.load_weights] quant_method={quant_method}, "
-                f"tp_size={tp_size}, tp_rank={tp_rank}, ep_size={ep_size}, ep_rank={ep_rank}"
-            )
-            self._debug_load_weights_logged = True
 
         if quant_method == "mxfp4":
             return self._load_weights_mxfp4(
