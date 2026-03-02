@@ -1304,6 +1304,11 @@ class GptOssModel(nn.Module):
         elif quant_method:
             quant_method = quant_method.lower()
 
+        # Final fallback: check the model ID directly
+        if quant_method != "nvfp4" and hasattr(self.config, "_name_or_path"):
+            if "nvfp4" in self.config._name_or_path.lower():
+                quant_method = "nvfp4"
+
         if quant_method == "mxfp4":
             return self._load_weights_mxfp4(
                 ep_rank_end,
