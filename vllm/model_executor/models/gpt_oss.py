@@ -1018,13 +1018,15 @@ class GptOssModel(nn.Module):
             if is_pp_missing_parameter(name, self):
                 continue
 
-            if ".w13_weight_scale_2" in name:
-                param = params_dict[name]
+            if ".w13_weight_scale_2" in name or ".w13_weight_scales_2" in name:
+                param_name = name.replace("scales_2", "scale_2")
+                param = params_dict[param_name]
                 param.copy_(weight)
                 loaded_params.add(name)
                 continue
-            elif ".w2_weight_scale_2" in name:
-                param = params_dict[name]
+            elif ".w2_weight_scale_2" in name or ".w2_weight_scales_2" in name:
+                param_name = name.replace("scales_2", "scale_2")
+                param = params_dict[param_name]
                 param.copy_(weight)
                 loaded_params.add(name)
                 continue
