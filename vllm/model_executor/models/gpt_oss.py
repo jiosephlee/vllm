@@ -1290,10 +1290,19 @@ class GptOssModel(nn.Module):
         ep_rank_end = (ep_rank + 1) * experts_per_rank
 
         quant_method = (
-            self.config.quantization_config["quant_method"]
-            if hasattr(self.config, "quantization_config")
-            else None
+            self.quant_config.get_name() if self.quant_config is not None else None
         )
+        if quant_method is None or quant_method == "modelopt":
+            q_config = getattr(self.config, "quantization_config", {})
+            quant_method = q_config.get("quant_method", quant_method)
+
+            # If it's a modelopt checkpoint, the actual method is in quant_algo
+            if quant_method == "modelopt":
+                quant_algo = q_config.get("quant_algo", "")
+                if quant_algo:
+                    quant_method = quant_algo.lower()
+        elif quant_method:
+            quant_method = quant_method.lower()
 
         if quant_method == "mxfp4":
             return self._load_weights_mxfp4(
