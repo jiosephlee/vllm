@@ -1036,7 +1036,7 @@ class GptOssModel(nn.Module):
                 else:
                     weight_to_copy = weight
                 param.copy_(weight_to_copy)
-                loaded_params.add(name)
+                loaded_params.add(param_name)
                 continue
             elif ".w2_weight_scale_2" in name or ".w2_weight_scales_2" in name:
                 param_name = name.replace("scales_2", "scale_2")
@@ -1047,7 +1047,7 @@ class GptOssModel(nn.Module):
                 else:
                     weight_to_copy = weight
                 param.copy_(weight_to_copy)
-                loaded_params.add(name)
+                loaded_params.add(param_name)
                 continue
             elif ".w13_weight_scale" in name:
                 if use_ep:
