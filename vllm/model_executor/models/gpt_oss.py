@@ -1005,6 +1005,13 @@ class GptOssModel(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
+        # Hack for NVFP4 weight-only quantization: The ModelOpt checkpoint has no input scales
+        # so vLLM strict checking throws an error since it initializes w13 and w2 with input_scale tensors.
+        for param_name, param in params_dict.items():
+            if ".w13_input_scale" in param_name or ".w2_input_scale" in param_name:
+                param.data.fill_(1.0)
+                loaded_params.add(param_name)
+
         use_ep = self.parallel_config.enable_expert_parallel
 
         # In MoE, we need to flatten the tensor parallel size across the data
