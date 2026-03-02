@@ -255,6 +255,15 @@ class GptOssModel(nn.Module):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
         self.quant_config = vllm_config.quant_config
+
+        # HACK: For NVFP4 checkpoints that incorrectly placed ignored layers under
+        # "modules_to_not_convert" instead of "ignore" or "exclude_modules"
+        if (
+            self.quant_config is not None
+            and getattr(self.quant_config, "exclude_modules", None) is not None
+        ):
+            self.quant_config.exclude_modules.extend(["*.attn.*", "*.router"])
+
         self.parallel_config = vllm_config.parallel_config
         self.config.hidden_size = self.config.hidden_size
         self.embedding = VocabParallelEmbedding(
