@@ -1455,8 +1455,19 @@ class GptOssForCausalLM(nn.Module, SupportsPP, SupportsEagle3, SupportsLoRA):
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # Filter out lingering ModelOpt _amax and _quantizer tensors from the checkpoint.
+        # Since we force attention layers to remain unquantized, if vLLM encounters these
+        # orphaned scaling factors it may incorrectly apply them, resulting in garbage text.
+        def _filter_weights(ws):
+            for name, w in ws:
+                if "_quantizer" in name or "_amax" in name:
+                    continue
+                yield name, w
+
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        return loader.load_weights(
+            _filter_weights(weights), mapper=self.hf_to_vllm_mapper
+        )
