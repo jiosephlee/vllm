@@ -1021,13 +1021,23 @@ class GptOssModel(nn.Module):
             if ".w13_weight_scale_2" in name or ".w13_weight_scales_2" in name:
                 param_name = name.replace("scales_2", "scale_2")
                 param = params_dict[param_name]
-                param.copy_(weight)
+                # gpt-oss NVFP4 pack has shape [32], but vLLM fused w13 expects [32, 2]
+                if weight.ndim == 1 and param.ndim == 2 and param.shape[1] == 2:
+                    weight_to_copy = weight.unsqueeze(1).expand(-1, 2)
+                else:
+                    weight_to_copy = weight
+                param.copy_(weight_to_copy)
                 loaded_params.add(name)
                 continue
             elif ".w2_weight_scale_2" in name or ".w2_weight_scales_2" in name:
                 param_name = name.replace("scales_2", "scale_2")
                 param = params_dict[param_name]
-                param.copy_(weight)
+                # gpt-oss NVFP4 pack has shape [32], but vLLM w2 expects [32, 1]
+                if weight.ndim == 1 and param.ndim == 2 and param.shape[1] == 1:
+                    weight_to_copy = weight.unsqueeze(1)
+                else:
+                    weight_to_copy = weight
+                param.copy_(weight_to_copy)
                 loaded_params.add(name)
                 continue
             elif ".w13_weight_scale" in name:
