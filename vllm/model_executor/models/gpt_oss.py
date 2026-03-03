@@ -969,30 +969,6 @@ class GptOssModel(nn.Module):
                 loaded_params.add(name)
         return loaded_params
 
-    def _load_weights_other(
-        self,
-        ep_rank_end: int,
-        ep_rank_start: int,
-        heads_per_rank: int,
-        head_start: int,
-        weights: Iterable[tuple[str, torch.Tensor]],
-        stacked_params_mapping: list[tuple[str, ...]],
-    ) -> set[str]:
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-
-        use_ep = self.parallel_config.enable_expert_parallel
-
-        # In MoE, we need to flatten the tensor parallel size across the data
-        # parallel size when EP is disabled.
-        tp_size, tp_rank = FusedMoEParallelConfig.flatten_tp_across_dp_and_pcp(
-            tp_size=get_tensor_model_parallel_world_size(),
-            dp_size=get_dp_group().world_size,
-            dp_rank=get_dp_group().rank_in_group,
-            pcp_size=get_pcp_group().world_size,
-            pcp_rank=get_pcp_group().rank_in_group,
-        )
-
     def _load_weights_nvfp4(
         self,
         ep_rank_end: int,
@@ -1005,8 +981,8 @@ class GptOssModel(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
-        # Hack for NVFP4 weight-only quantization: The ModelOpt checkpoint has no input scales
-        # so vLLM strict checking throws an error since it initializes w13 and w2 with input_scale tensors.
+        # NVFP4 weight-only checkpoints may omit input scales; pre-fill with 1.0.
+        # These are overwritten below if the checkpoint contains them.
         for param_name, param in params_dict.items():
             if ".w13_input_scale" in param_name or ".w2_input_scale" in param_name:
                 param.data.fill_(1.0)
@@ -1014,8 +990,8 @@ class GptOssModel(nn.Module):
 
         use_ep = self.parallel_config.enable_expert_parallel
 
-        # In MoE, we need to flatten the tensor parallel size across the data
-        # parallel size when EP is disabled.
+        # TP parameters needed for bias loading (FusedMoE weight_loader does not
+        # handle bias, so we handle TP sharding manually for those).
         tp_size, tp_rank = FusedMoEParallelConfig.flatten_tp_across_dp_and_pcp(
             tp_size=get_tensor_model_parallel_world_size(),
             dp_size=get_dp_group().world_size,
@@ -1025,7 +1001,6 @@ class GptOssModel(nn.Module):
         )
         intermediate_size = self.config.intermediate_size
         per_rank_intermediate_size = cdiv(intermediate_size, tp_size)
-        # Calculate common slicing bounds for current rank
         tp_rank_start = tp_rank * per_rank_intermediate_size
         tp_rank_end = min((tp_rank + 1) * per_rank_intermediate_size, intermediate_size)
 
@@ -1037,113 +1012,124 @@ class GptOssModel(nn.Module):
             if ".w13_weight_scale_2" in name or ".w13_weight_scales_2" in name:
                 param_name = name.replace("scales_2", "scale_2")
                 param = params_dict[param_name]
-                # gpt-oss NVFP4 pack has shape [32], but vLLM fused w13 expects [32, 2]
+                if use_ep:
+                    weight = weight[ep_rank_start:ep_rank_end]
+                # gpt-oss NVFP4 checkpoint stores shape [E]; vLLM fused w13 expects [E, 2]
+                # (same global scale is broadcast to both w1 and w3)
                 if weight.ndim == 1 and param.ndim == 2 and param.shape[1] == 2:
-                    weight_to_copy = weight.unsqueeze(1).expand(-1, 2)
-                else:
-                    weight_to_copy = weight
-                param.copy_(weight_to_copy)
+                    weight = weight.unsqueeze(1).expand(-1, 2).clone()
+                param.data.copy_(weight)
                 loaded_params.add(param_name)
                 continue
+
             elif ".w2_weight_scale_2" in name or ".w2_weight_scales_2" in name:
                 param_name = name.replace("scales_2", "scale_2")
                 param = params_dict[param_name]
-                # gpt-oss NVFP4 pack has shape [32], but vLLM w2 expects [32, 1]
+                if use_ep:
+                    weight = weight[ep_rank_start:ep_rank_end]
+                # gpt-oss NVFP4 checkpoint stores shape [E]; vLLM w2 expects [E, 1]
                 if weight.ndim == 1 and param.ndim == 2 and param.shape[1] == 1:
-                    weight_to_copy = weight.unsqueeze(1)
-                else:
-                    weight_to_copy = weight
-                param.copy_(weight_to_copy)
+                    weight = weight.unsqueeze(1)
+                param.data.copy_(weight)
                 loaded_params.add(param_name)
                 continue
+
             elif ".w13_weight_scale" in name:
+                # Backward compat: flatten 4D → 3D if needed
+                if weight.ndim == 4:
+                    weight = weight.reshape(weight.shape[0], weight.shape[1], -1)
                 if use_ep:
-                    narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
-                else:
-                    narrow_weight = weight[:, 2 * tp_rank_start : 2 * tp_rank_end, :]
+                    weight = weight[ep_rank_start:ep_rank_end]
                 param = params_dict[name]
-                param.copy_(narrow_weight)
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                # The combined w13 scale (both w1+w3 in dim 1) is handled by
+                # FusedMoE._load_combined_w13_weight_scale via shard_id="w1".
+                # ep_rank_start is a valid global expert on this EP rank, which
+                # prevents the weight_loader from skipping non-local experts.
+                weight_loader(param, weight, name, "w1", ep_rank_start)
                 loaded_params.add(name)
                 continue
+
             elif ".w2_weight_scale" in name:
                 if use_ep:
-                    narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
-                else:
-                    param = params_dict[name]
-                    slice_size = param.shape[2]
-                    slice_start = tp_rank * slice_size
-                    narrow_weight = weight[:, :, slice_start : slice_start + slice_size]
+                    weight = weight[ep_rank_start:ep_rank_end]
                 param = params_dict[name]
-                param.copy_(narrow_weight)
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, weight, name, "w2", ep_rank_start)
                 loaded_params.add(name)
                 continue
+
             elif ".w13_input_scale" in name or ".w2_input_scale" in name:
+                # Pre-filled with 1.0 above; overwrite if the checkpoint provides scales.
                 if name in params_dict:
                     param = params_dict[name]
-                    param.copy_(weight)
+                    if use_ep:
+                        weight = weight[ep_rank_start:ep_rank_end]
+                    param.data.copy_(weight)
                     loaded_params.add(name)
                 continue
+
             elif ".w13_weight" in name:
-                # Handle MLP gate and up projection weights
                 # Backward compat: flatten 4D [E, out, nblk, bsz//2] → 3D
                 if weight.ndim == 4:
                     weight = weight.reshape(weight.shape[0], weight.shape[1], -1)
-
                 if use_ep:
-                    narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
-                else:
-                    narrow_weight = weight[:, 2 * tp_rank_start : 2 * tp_rank_end, :]
+                    weight = weight[ep_rank_start:ep_rank_end]
+                # w13_weight has w1 and w3 fused along dim 1: (E, 2*N, K//2).
+                # Split and load each half via weight_loader so it can apply
+                # TP sharding (via _load_w13) and any quant-method-specific logic.
+                intermediate = weight.shape[1] // 2
+                w1_weight = weight[:, :intermediate, :]
+                w3_weight = weight[:, intermediate:, :]
                 param = params_dict[name]
-                param.copy_(narrow_weight)
-
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, w1_weight, name, "w1", ep_rank_start)
+                weight_loader(param, w3_weight, name, "w3", ep_rank_start)
                 loaded_params.add(name)
                 continue
+
             elif ".w2_weight" in name:
-                # Handle MLP down projection weights
                 # Backward compat: flatten 4D → 3D
                 if weight.ndim == 4:
                     weight = weight.reshape(weight.shape[0], weight.shape[1], -1)
-
                 if use_ep:
-                    narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
-                else:
-                    narrow_weight = weight[:, :, tp_rank_start // 2 : tp_rank_end // 2]
+                    weight = weight[ep_rank_start:ep_rank_end]
                 param = params_dict[name]
-                param.copy_(narrow_weight)
-
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, weight, name, "w2", ep_rank_start)
                 loaded_params.add(name)
                 continue
+
             elif ".w13_bias" in name:
-                # Handle MLP gate and up projection biases
-                # Extract gate and up projection bias parts
+                # FusedMoE weight_loader does not handle bias; apply TP/EP manually.
                 if use_ep:
                     narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
                 else:
                     narrow_weight = weight[:, 2 * tp_rank_start : 2 * tp_rank_end]
-
                 param = params_dict[name]
                 param.copy_(narrow_weight)
                 loaded_params.add(name)
                 continue
+
             elif ".w2_bias" in name:
-                # Handle MLP down projection bias
                 if use_ep:
                     weight = weight[ep_rank_start:ep_rank_end, ...]
                 else:
-                    # (only load on rank 0 to avoid duplication)
+                    # Only load on rank 0 to avoid duplication across TP ranks.
                     if tp_rank != 0:
                         weight.zero_()
                 param = params_dict[name]
                 param.copy_(weight)
                 loaded_params.add(name)
                 continue
+
             elif "sinks" in name:
-                # Handle attention sinks (distributed across ranks)
                 param = params_dict[name]
                 narrow_weight = weight.narrow(0, head_start, heads_per_rank)
                 param.data.copy_(narrow_weight)
                 loaded_params.add(name)
                 continue
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -1156,7 +1142,6 @@ class GptOssModel(nn.Module):
                     weight_loader(param, weight, shard_id)
                 break
             else:
-                # Handle all other weights with potential renaming
                 if name not in params_dict:
                     continue
                 param = params_dict[name]
