@@ -43,6 +43,8 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import AttentionType
 
+from vllm.logger import init_logger
+
 from .interfaces import SupportsEagle3, SupportsLoRA, SupportsPP
 from .utils import (
     AutoWeightsLoader,
@@ -53,6 +55,8 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
+
+logger = init_logger(__name__)
 
 
 class OAIAttention(nn.Module):
@@ -1009,6 +1013,8 @@ class GptOssModel(nn.Module):
             if is_pp_missing_parameter(name, self):
                 continue
 
+            logger.debug("[nvfp4] processing key=%r shape=%s", name, list(weight.shape))
+
             if ".w13_weight_scale_2" in name or ".w13_weight_scales_2" in name:
                 param_name = name.replace("scales_2", "scale_2")
                 param = params_dict[param_name]
@@ -1148,6 +1154,43 @@ class GptOssModel(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, weight)
             loaded_params.add(name)
+
+        # ---- post-load diagnostics ----
+        # Log any NVFP4 expert params that were NOT loaded (silent drops = garbage).
+        nvfp4_suffixes = (
+            "w13_weight", "w2_weight",
+            "w13_weight_scale", "w2_weight_scale",
+            "w13_weight_scale_2", "w2_weight_scale_2",
+        )
+        unloaded = [
+            k for k in params_dict
+            if any(k.endswith(s) for s in nvfp4_suffixes)
+            and k not in loaded_params
+        ]
+        if unloaded:
+            logger.warning(
+                "[nvfp4] %d NVFP4 params were NOT loaded (likely silent drop "
+                "due to missing checkpoint key or mapper mismatch):\n  %s",
+                len(unloaded),
+                "\n  ".join(sorted(unloaded)[:20]),
+            )
+        else:
+            logger.info("[nvfp4] All NVFP4 expert params loaded successfully.")
+
+        # Spot-check layer 0 scale values to catch zero/NaN corruption.
+        for suffix in ("w13_weight_scale_2", "w2_weight_scale_2",
+                       "w13_weight_scale", "w2_weight_scale"):
+            key = next((k for k in params_dict if "layers.0." in k and k.endswith(suffix)), None)
+            if key and key in loaded_params:
+                v = params_dict[key].data
+                logger.info(
+                    "[nvfp4] layer0 %s: shape=%s min=%.4g max=%.4g "
+                    "has_nan=%s has_zero=%s",
+                    suffix, list(v.shape),
+                    v.float().min().item(), v.float().max().item(),
+                    bool(v.isnan().any()), bool((v == 0).all()),
+                )
+
         return loaded_params
 
     def _load_weights_other(
@@ -1321,6 +1364,15 @@ class GptOssModel(nn.Module):
         if quant_method != "nvfp4" and hasattr(self.config, "_name_or_path"):
             if "nvfp4" in self.config._name_or_path.lower():
                 quant_method = "nvfp4"
+
+        logger.info(
+            "[gpt_oss] load_weights: resolved quant_method=%r "
+            "(quant_config=%r, quantization_config=%r, _name_or_path=%r)",
+            quant_method,
+            self.quant_config.get_name() if self.quant_config is not None else None,
+            getattr(self.config, "quantization_config", {}).get("quant_algo"),
+            getattr(self.config, "_name_or_path", None),
+        )
 
         if quant_method == "mxfp4":
             return self._load_weights_mxfp4(
