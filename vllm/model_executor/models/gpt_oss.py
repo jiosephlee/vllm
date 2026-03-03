@@ -1011,9 +1011,11 @@ class GptOssModel(nn.Module):
         _key_sample: list[str] = []
         _key_count = 0
 
+        _pp_skipped: list[str] = []
         for name, weight in weights:
             # Skip layers on other devices.
             if is_pp_missing_parameter(name, self):
+                _pp_skipped.append(name)
                 continue
 
             _key_count += 1
@@ -1045,7 +1047,9 @@ class GptOssModel(nn.Module):
                 param = params_dict[param_name]
                 if use_ep:
                     weight = weight[ep_rank_start:ep_rank_end]
-                # gpt-oss NVFP4 checkpoint stores shape [E]; vLLM w2 expects [E, 1]
+                # gpt-oss NVFP4 checkpoint stores shape [E]; vLLM w2_weight_scale_2 is
+                # also [E] (PerTensorScaleParameter). Guard handles any checkpoint
+                # variant that saves [E,1] instead.
                 if weight.ndim == 1 and param.ndim == 2 and param.shape[1] == 1:
                     weight = weight.unsqueeze(1)
                 param.data.copy_(weight)
@@ -1188,6 +1192,18 @@ class GptOssModel(nn.Module):
             "[nvfp4] weight loop done: %d keys processed (first 10 samples: %s)",
             _key_count, _key_sample,
         )
+        if _pp_skipped:
+            # Log first few PP-skipped expert keys (not all, to avoid spam).
+            expert_skipped = [k for k in _pp_skipped
+                              if any(s in k for s in (".w13_weight", ".w2_weight"))]
+            logger.warning(
+                "[nvfp4] %d keys skipped by is_pp_missing_parameter "
+                "(%d expert-weight keys among them). "
+                "If PP=1, this is unexpected. First 10: %s",
+                len(_pp_skipped), len(expert_skipped), _pp_skipped[:10],
+            )
+        else:
+            logger.info("[nvfp4] No keys skipped by is_pp_missing_parameter.")
 
         # ---- post-load diagnostics ----
         # Log any NVFP4 expert params that were NOT loaded (silent drops = garbage).
@@ -1537,4 +1553,62 @@ class GptOssForCausalLM(nn.Module, SupportsPP, SupportsEagle3, SupportsLoRA):
             self,
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        result = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        self._log_nvfp4_post_load_check()
+        return result
+
+    def _log_nvfp4_post_load_check(self) -> None:
+        """
+        After all weight-loading calls complete, scan every MoE layer and verify
+        NVFP4 scale_2 AND packed-weight tensors are non-zero and finite.
+        Runs after ALL AutoWeightsLoader batches so dual-call false-positives
+        from the per-call diagnostics in _load_weights_nvfp4 do not affect this.
+        """
+        bad_layers: list[str] = []
+        good_layers: list[str] = []
+        for layer_name, module in self.named_modules():
+            w13_s2 = getattr(module, "w13_weight_scale_2", None)
+            if w13_s2 is None:
+                continue
+
+            # Check global scale (fp32) – if all zeros the layer wasn't loaded.
+            vs = w13_s2.data.float()
+            scale_zero = bool((vs == 0).all())
+            scale_nan = bool(vs.isnan().any())
+
+            # Check packed uint8 weight – use a small sample to avoid scanning
+            # the full tensor (which can be hundreds of MB per layer).
+            w13_w = getattr(module, "w13_weight", None)
+            w_zero = bool(
+                w13_w is not None
+                and (w13_w.data.flatten()[:4096] == 0).all()
+            )
+
+            tag = (
+                f"{layer_name}["
+                f"w13_scale_2 shape={list(w13_s2.shape)} "
+                f"min={vs.min().item():.4g} max={vs.max().item():.4g} "
+                f"scale_zero={scale_zero} scale_nan={scale_nan} "
+                f"weight_all_zero={w_zero}]"
+            )
+            if scale_zero or scale_nan or w_zero:
+                bad_layers.append(tag)
+            else:
+                good_layers.append(layer_name)
+
+        if not good_layers and not bad_layers:
+            # Not an NVFP4 model – no w13_weight_scale_2 parameters found.
+            return
+
+        if bad_layers:
+            logger.warning(
+                "[nvfp4] POST-LOAD CHECK: %d MoE layers have zero/NaN scale_2 "
+                "or all-zero packed weights (likely not loaded!):\n  %s\n"
+                "  (%d layers look OK)",
+                len(bad_layers), "\n  ".join(bad_layers), len(good_layers),
+            )
+        else:
+            logger.info(
+                "[nvfp4] POST-LOAD CHECK: all %d MoE layers have valid "
+                "non-zero scale_2 AND non-zero packed weights ✓", len(good_layers),
+            )
