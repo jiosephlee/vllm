@@ -1385,16 +1385,18 @@ class GptOssForCausalLM(nn.Module, SupportsPP, SupportsEagle3, SupportsLoRA):
         },
         orig_to_new_suffix={
             ".embed_tokens.weight": ".embedding.weight",
-            # MoE MXFP4 / NVFP4 weights
+            # MoE MXFP4/NVFP4 weights
             ".gate_up_proj_blocks": ".w13_weight",
             ".down_proj_blocks": ".w2_weight",
             ".gate_up_proj_scales": ".w13_weight_scale",
             ".down_proj_scales": ".w2_weight_scale",
-            # NVFP4 global scales (both plural and singular for compat)
-            ".gate_up_proj_scales_2": ".w13_weight_scales_2",
-            ".down_proj_scales_2": ".w2_weight_scales_2",
+            ".gate_up_proj_scale": ".w13_weight_scale",
+            ".down_proj_scale": ".w2_weight_scale",
+            # NVFP4 global scales (per-tensor FP32)
             ".gate_up_proj_scale_2": ".w13_weight_scale_2",
             ".down_proj_scale_2": ".w2_weight_scale_2",
+            ".gate_up_proj_scales_2": ".w13_weight_scale_2",
+            ".down_proj_scales_2": ".w2_weight_scale_2",
             # MoE other weights
             ".gate_up_proj": ".w13_weight",
             ".down_proj": ".w2_weight",
