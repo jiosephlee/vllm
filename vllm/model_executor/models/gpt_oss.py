@@ -1008,12 +1008,24 @@ class GptOssModel(nn.Module):
         tp_rank_start = tp_rank * per_rank_intermediate_size
         tp_rank_end = min((tp_rank + 1) * per_rank_intermediate_size, intermediate_size)
 
+        _key_sample: list[str] = []
+        _key_count = 0
+
         for name, weight in weights:
             # Skip layers on other devices.
             if is_pp_missing_parameter(name, self):
                 continue
 
+            _key_count += 1
+            if _key_count <= 10:
+                _key_sample.append(f"{name}{list(weight.shape)}")
+
             logger.debug("[nvfp4] processing key=%r shape=%s", name, list(weight.shape))
+
+            # Visible at INFO: lets us confirm expert keys are reaching this function
+            # and what their exact names are (helps diagnose mapper/prefix issues).
+            if any(s in name for s in (".w13_weight", ".w2_weight", ".w13_bias", ".w2_bias")):
+                logger.info("[nvfp4] expert key: %r shape=%s", name, list(weight.shape))
 
             if ".w13_weight_scale_2" in name or ".w13_weight_scales_2" in name:
                 param_name = name.replace("scales_2", "scale_2")
@@ -1046,6 +1058,10 @@ class GptOssModel(nn.Module):
                     weight = weight.reshape(weight.shape[0], weight.shape[1], -1)
                 if use_ep:
                     weight = weight[ep_rank_start:ep_rank_end]
+                if name not in params_dict:
+                    logger.warning("[nvfp4] w13_weight_scale key %r not in params_dict; available suffixes: %s",
+                                   name, [k for k in params_dict if "w13_weight_scale" in k][:5])
+                    continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 # The combined w13 scale (both w1+w3 in dim 1) is handled by
@@ -1059,6 +1075,9 @@ class GptOssModel(nn.Module):
             elif ".w2_weight_scale" in name:
                 if use_ep:
                     weight = weight[ep_rank_start:ep_rank_end]
+                if name not in params_dict:
+                    logger.warning("[nvfp4] w2_weight_scale key %r not in params_dict", name)
+                    continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, weight, name, "w2", ep_rank_start)
@@ -1081,6 +1100,11 @@ class GptOssModel(nn.Module):
                     weight = weight.reshape(weight.shape[0], weight.shape[1], -1)
                 if use_ep:
                     weight = weight[ep_rank_start:ep_rank_end]
+                if name not in params_dict:
+                    logger.warning("[nvfp4] w13_weight key %r not in params_dict; "
+                                   "available w13 keys: %s",
+                                   name, [k for k in params_dict if "w13_weight" in k][:5])
+                    continue
                 # w13_weight has w1 and w3 fused along dim 1: (E, 2*N, K//2).
                 # Split and load each half via weight_loader so it can apply
                 # TP sharding (via _load_w13) and any quant-method-specific logic.
@@ -1100,6 +1124,11 @@ class GptOssModel(nn.Module):
                     weight = weight.reshape(weight.shape[0], weight.shape[1], -1)
                 if use_ep:
                     weight = weight[ep_rank_start:ep_rank_end]
+                if name not in params_dict:
+                    logger.warning("[nvfp4] w2_weight key %r not in params_dict; "
+                                   "available w2 keys: %s",
+                                   name, [k for k in params_dict if "w2_weight" in k][:5])
+                    continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, weight, name, "w2", ep_rank_start)
@@ -1154,6 +1183,11 @@ class GptOssModel(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, weight)
             loaded_params.add(name)
+
+        logger.info(
+            "[nvfp4] weight loop done: %d keys processed (first 10 samples: %s)",
+            _key_count, _key_sample,
+        )
 
         # ---- post-load diagnostics ----
         # Log any NVFP4 expert params that were NOT loaded (silent drops = garbage).
