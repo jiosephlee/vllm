@@ -1022,13 +1022,6 @@ class GptOssModel(nn.Module):
             if _key_count <= 10:
                 _key_sample.append(f"{name}{list(weight.shape)}")
 
-            logger.debug("[nvfp4] processing key=%r shape=%s", name, list(weight.shape))
-
-            # Visible at INFO: lets us confirm expert keys are reaching this function
-            # and what their exact names are (helps diagnose mapper/prefix issues).
-            if any(s in name for s in (".w13_weight", ".w2_weight", ".w13_bias", ".w2_bias")):
-                logger.info("[nvfp4] expert key: %r shape=%s", name, list(weight.shape))
-
             if ".w13_weight_scale_2" in name or ".w13_weight_scales_2" in name:
                 param_name = name.replace("scales_2", "scale_2")
                 param = params_dict[param_name]
@@ -1524,6 +1517,7 @@ class GptOssForCausalLM(nn.Module, SupportsPP, SupportsEagle3, SupportsLoRA):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+        self._nvfp4_fwd_diag_done = False
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         self.model.aux_hidden_state_layers = layers
@@ -1542,6 +1536,12 @@ class GptOssForCausalLM(nn.Module, SupportsPP, SupportsEagle3, SupportsLoRA):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if not self._nvfp4_fwd_diag_done:
+            self._nvfp4_fwd_diag_done = True
+            try:
+                self._log_nvfp4_kernel_config_check()
+            except Exception as _diag_err:
+                logger.warning("[nvfp4] kernel_config_check raised: %s", _diag_err)
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1554,8 +1554,98 @@ class GptOssForCausalLM(nn.Module, SupportsPP, SupportsEagle3, SupportsLoRA):
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
         )
         result = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-        self._log_nvfp4_post_load_check()
+        try:
+            self._log_nvfp4_post_load_check()
+        except Exception as _diag_err:
+            logger.warning("[nvfp4] post_load_check raised: %s", _diag_err)
         return result
+
+    def _log_nvfp4_kernel_config_check(self) -> None:
+        """
+        Runs on the first forward call (after process_weights_after_loading).
+        Checks that every NVFP4 FusedMoE layer has a valid moe_quant_config:
+        g1_alphas, g2_alphas, a1_gscale, a2_gscale all non-zero, non-NaN.
+        """
+        def _fmt(t: object) -> str:
+            if t is None:
+                return "None"
+            if isinstance(t, torch.Tensor):
+                tf = t.float()
+                return (
+                    f"shape={list(t.shape)} dtype={t.dtype} "
+                    f"min={tf.min().item():.4g} max={tf.max().item():.4g} "
+                    f"has_nan={bool(tf.isnan().any())} "
+                    f"all_zero={bool((tf == 0).all())}"
+                )
+            return repr(t)
+
+        found_any = False
+        bad_layers: list[str] = []
+        good_layers: list[str] = []
+        first_moe_qc = None
+        first_moe_backend: object = "unknown"
+
+        def _bad(t: object) -> bool:
+            if not isinstance(t, torch.Tensor):
+                return t is None
+            tf = t.float()
+            return bool(tf.isnan().any()) or bool((tf == 0).all())
+
+        for name, module in self.named_modules():
+            qm = getattr(module, "quant_method", None)
+            if qm is None:
+                continue
+            moe_qc = getattr(qm, "moe_quant_config", None)
+            if moe_qc is None:
+                continue
+
+            found_any = True
+            moe_backend = getattr(qm, "nvfp4_backend", "unknown")
+            if first_moe_qc is None:
+                first_moe_qc = moe_qc
+                first_moe_backend = moe_backend
+
+            g1 = getattr(moe_qc, "g1_alphas", None)
+            g2 = getattr(moe_qc, "g2_alphas", None)
+            a1 = getattr(moe_qc, "a1_gscale", None)
+            a2 = getattr(moe_qc, "a2_gscale", None)
+
+            # a1/a2_gscale may be None for w4a16 (MARLIN) backend — not an error
+            is_bad = _bad(g1) or _bad(g2) or (
+                a1 is not None and _bad(a1)
+            ) or (
+                a2 is not None and _bad(a2)
+            )
+            tag = (
+                f"{name}[backend={moe_backend}]: g1_alphas={_fmt(g1)} "
+                f"| g2_alphas={_fmt(g2)} "
+                f"| a1_gscale={_fmt(a1)} | a2_gscale={_fmt(a2)}"
+            )
+            if is_bad:
+                bad_layers.append(tag)
+            else:
+                good_layers.append(name)
+
+        if not found_any:
+            logger.info("[nvfp4] kernel_config_check: no NVFP4 moe_quant_config found")
+            return
+
+        if bad_layers:
+            logger.warning(
+                "[nvfp4] KERNEL CONFIG CHECK: %d NVFP4 MoE layers have zero/NaN "
+                "kernel config (process_weights_after_loading may have failed):\n  %s\n"
+                "  (%d layers look OK)",
+                len(bad_layers), "\n  ".join(bad_layers), len(good_layers),
+            )
+        else:
+            g1 = getattr(first_moe_qc, "g1_alphas", None)
+            a1 = getattr(first_moe_qc, "a1_gscale", None)
+            logger.info(
+                "[nvfp4] KERNEL CONFIG CHECK: all %d NVFP4 MoE layers have valid "
+                "kernel quant config ✓ (MoE backend=%s, first layer spot-check: "
+                "g1_alphas=%s, a1_gscale=%s)",
+                len(good_layers), first_moe_backend, _fmt(g1), _fmt(a1),
+            )
 
     def _log_nvfp4_post_load_check(self) -> None:
         """
@@ -1571,27 +1661,47 @@ class GptOssForCausalLM(nn.Module, SupportsPP, SupportsEagle3, SupportsLoRA):
             if w13_s2 is None:
                 continue
 
-            # Check global scale (fp32) – if all zeros the layer wasn't loaded.
-            vs = w13_s2.data.float()
-            scale_zero = bool((vs == 0).all())
-            scale_nan = bool(vs.isnan().any())
+            # --- w13 checks ---
+            vs13 = w13_s2.data.float()
+            w13_scale_zero = bool((vs13 == 0).all())
+            w13_scale_nan = bool(vs13.isnan().any())
 
-            # Check packed uint8 weight – use a small sample to avoid scanning
-            # the full tensor (which can be hundreds of MB per layer).
             w13_w = getattr(module, "w13_weight", None)
-            w_zero = bool(
+            w13_w_zero = bool(
                 w13_w is not None
                 and (w13_w.data.flatten()[:4096] == 0).all()
             )
 
+            # --- w2 checks ---
+            w2_s2 = getattr(module, "w2_weight_scale_2", None)
+            w2_scale_zero = False
+            w2_scale_nan = False
+            w2_w_zero = False
+            vs2_str = "N/A"
+            if w2_s2 is not None:
+                vs2 = w2_s2.data.float()
+                w2_scale_zero = bool((vs2 == 0).all())
+                w2_scale_nan = bool(vs2.isnan().any())
+                vs2_str = f"min={vs2.min().item():.4g} max={vs2.max().item():.4g}"
+            w2_w = getattr(module, "w2_weight", None)
+            if w2_w is not None:
+                w2_w_zero = bool((w2_w.data.flatten()[:4096] == 0).all())
+
+            any_bad = (
+                w13_scale_zero or w13_scale_nan or w13_w_zero
+                or w2_scale_zero or w2_scale_nan or w2_w_zero
+            )
             tag = (
                 f"{layer_name}["
-                f"w13_scale_2 shape={list(w13_s2.shape)} "
-                f"min={vs.min().item():.4g} max={vs.max().item():.4g} "
-                f"scale_zero={scale_zero} scale_nan={scale_nan} "
-                f"weight_all_zero={w_zero}]"
+                f"w13_s2 shape={list(w13_s2.shape)} "
+                f"min={vs13.min().item():.4g} max={vs13.max().item():.4g} "
+                f"w13_s2_zero={w13_scale_zero} w13_s2_nan={w13_scale_nan} "
+                f"w13_w_zero={w13_w_zero} | "
+                f"w2_s2 {vs2_str} "
+                f"w2_s2_zero={w2_scale_zero} w2_s2_nan={w2_scale_nan} "
+                f"w2_w_zero={w2_w_zero}]"
             )
-            if scale_zero or scale_nan or w_zero:
+            if any_bad:
                 bad_layers.append(tag)
             else:
                 good_layers.append(layer_name)
@@ -1610,5 +1720,6 @@ class GptOssForCausalLM(nn.Module, SupportsPP, SupportsEagle3, SupportsLoRA):
         else:
             logger.info(
                 "[nvfp4] POST-LOAD CHECK: all %d MoE layers have valid "
-                "non-zero scale_2 AND non-zero packed weights ✓", len(good_layers),
+                "non-zero w13+w2 scale_2 AND non-zero packed weights ✓",
+                len(good_layers),
             )
