@@ -43,6 +43,8 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import AttentionType
 
+from vllm.logger import init_logger
+
 from .interfaces import SupportsEagle3, SupportsLoRA, SupportsPP
 from .utils import (
     AutoWeightsLoader,
@@ -53,6 +55,8 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
+
+logger = init_logger(__name__)
 
 
 class OAIAttention(nn.Module):
@@ -969,30 +973,6 @@ class GptOssModel(nn.Module):
                 loaded_params.add(name)
         return loaded_params
 
-    def _load_weights_other(
-        self,
-        ep_rank_end: int,
-        ep_rank_start: int,
-        heads_per_rank: int,
-        head_start: int,
-        weights: Iterable[tuple[str, torch.Tensor]],
-        stacked_params_mapping: list[tuple[str, ...]],
-    ) -> set[str]:
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-
-        use_ep = self.parallel_config.enable_expert_parallel
-
-        # In MoE, we need to flatten the tensor parallel size across the data
-        # parallel size when EP is disabled.
-        tp_size, tp_rank = FusedMoEParallelConfig.flatten_tp_across_dp_and_pcp(
-            tp_size=get_tensor_model_parallel_world_size(),
-            dp_size=get_dp_group().world_size,
-            dp_rank=get_dp_group().rank_in_group,
-            pcp_size=get_pcp_group().world_size,
-            pcp_rank=get_pcp_group().rank_in_group,
-        )
-
     def _load_weights_nvfp4(
         self,
         ep_rank_end: int,
@@ -1005,8 +985,8 @@ class GptOssModel(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
-        # Hack for NVFP4 weight-only quantization: The ModelOpt checkpoint has no input scales
-        # so vLLM strict checking throws an error since it initializes w13 and w2 with input_scale tensors.
+        # NVFP4 weight-only checkpoints may omit input scales; pre-fill with 1.0.
+        # These are overwritten below if the checkpoint contains them.
         for param_name, param in params_dict.items():
             if ".w13_input_scale" in param_name or ".w2_input_scale" in param_name:
                 param.data.fill_(1.0)
@@ -1014,8 +994,8 @@ class GptOssModel(nn.Module):
 
         use_ep = self.parallel_config.enable_expert_parallel
 
-        # In MoE, we need to flatten the tensor parallel size across the data
-        # parallel size when EP is disabled.
+        # TP parameters needed for bias loading (FusedMoE weight_loader does not
+        # handle bias, so we handle TP sharding manually for those).
         tp_size, tp_rank = FusedMoEParallelConfig.flatten_tp_across_dp_and_pcp(
             tp_size=get_tensor_model_parallel_world_size(),
             dp_size=get_dp_group().world_size,
@@ -1025,61 +1005,93 @@ class GptOssModel(nn.Module):
         )
         intermediate_size = self.config.intermediate_size
         per_rank_intermediate_size = cdiv(intermediate_size, tp_size)
-        # Calculate common slicing bounds for current rank
         tp_rank_start = tp_rank * per_rank_intermediate_size
         tp_rank_end = min((tp_rank + 1) * per_rank_intermediate_size, intermediate_size)
 
+        _key_sample: list[str] = []
+        _key_count = 0
+
+        _pp_skipped: list[str] = []
         for name, weight in weights:
             # Skip layers on other devices.
             if is_pp_missing_parameter(name, self):
+                _pp_skipped.append(name)
                 continue
+
+            _key_count += 1
+            if _key_count <= 10:
+                _key_sample.append(f"{name}{list(weight.shape)}")
 
             if ".w13_weight_scale_2" in name or ".w13_weight_scales_2" in name:
                 param_name = name.replace("scales_2", "scale_2")
                 param = params_dict[param_name]
-                # gpt-oss NVFP4 pack has shape [32], but vLLM fused w13 expects [32, 2]
+                if use_ep:
+                    weight = weight[ep_rank_start:ep_rank_end]
+                # gpt-oss NVFP4 checkpoint stores shape [E]; vLLM fused w13 expects [E, 2]
+                # (same global scale is broadcast to both w1 and w3)
                 if weight.ndim == 1 and param.ndim == 2 and param.shape[1] == 2:
-                    weight_to_copy = weight.unsqueeze(1).expand(-1, 2)
-                else:
-                    weight_to_copy = weight
-                param.copy_(weight_to_copy)
+                    weight = weight.unsqueeze(1).expand(-1, 2).clone()
+                param.data.copy_(weight)
                 loaded_params.add(param_name)
                 continue
+
             elif ".w2_weight_scale_2" in name or ".w2_weight_scales_2" in name:
                 param_name = name.replace("scales_2", "scale_2")
                 param = params_dict[param_name]
-                # gpt-oss NVFP4 pack has shape [32], but vLLM w2 expects [32, 1]
+                if use_ep:
+                    weight = weight[ep_rank_start:ep_rank_end]
+                # gpt-oss NVFP4 checkpoint stores shape [E]; vLLM w2_weight_scale_2 is
+                # also [E] (PerTensorScaleParameter). Guard handles any checkpoint
+                # variant that saves [E,1] instead.
                 if weight.ndim == 1 and param.ndim == 2 and param.shape[1] == 1:
-                    weight_to_copy = weight.unsqueeze(1)
-                else:
-                    weight_to_copy = weight
-                param.copy_(weight_to_copy)
+                    weight = weight.unsqueeze(1)
+                param.data.copy_(weight)
                 loaded_params.add(param_name)
                 continue
+
             elif ".w13_weight_scale" in name:
+                # Backward compat: flatten 4D → 3D if needed
+                if weight.ndim == 4:
+                    weight = weight.reshape(weight.shape[0], weight.shape[1], -1)
                 if use_ep:
-                    narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
-                else:
-                    narrow_weight = weight[:, 2 * tp_rank_start : 2 * tp_rank_end, :]
+                    weight = weight[ep_rank_start:ep_rank_end]
+                if name not in params_dict:
+                    logger.warning(
+                        "[nvfp4] w13_weight_scale key %r not in params_dict; available suffixes: %s",
+                        name,
+                        [k for k in params_dict if "w13_weight_scale" in k][:5],
+                    )
+                    continue
                 param = params_dict[name]
-                param.copy_(narrow_weight)
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                # The combined w13 scale (both w1+w3 in dim 1) is handled by
+                # FusedMoE._load_combined_w13_weight_scale via shard_id="w1".
+                # ep_rank_start is a valid global expert on this EP rank, which
+                # prevents the weight_loader from skipping non-local experts.
+                weight_loader(param, weight, name, "w1", ep_rank_start)
                 loaded_params.add(name)
                 continue
+
             elif ".w2_weight_scale" in name:
                 if use_ep:
-                    narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
-                else:
-                    param = params_dict[name]
-                    slice_size = param.shape[2]
-                    slice_start = tp_rank * slice_size
-                    narrow_weight = weight[:, :, slice_start : slice_start + slice_size]
+                    weight = weight[ep_rank_start:ep_rank_end]
+                if name not in params_dict:
+                    logger.warning(
+                        "[nvfp4] w2_weight_scale key %r not in params_dict", name
+                    )
+                    continue
                 param = params_dict[name]
-                param.copy_(narrow_weight)
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, weight, name, "w2", ep_rank_start)
                 loaded_params.add(name)
                 continue
+
             elif ".w13_input_scale" in name or ".w2_input_scale" in name:
+                # Pre-filled with 1.0 above; overwrite if the checkpoint provides scales.
                 if name in params_dict:
                     param = params_dict[name]
+                    if use_ep:
+                        weight = weight[ep_rank_start:ep_rank_end]
                     # Calibration checkpoint saves [E] but vLLM creates
                     # w13_input_scale as [E, 2] (gate + up shards).
                     # Expand to match the param shape.
@@ -1090,67 +1102,84 @@ class GptOssModel(nn.Module):
                     param.copy_(weight_to_copy)
                     loaded_params.add(name)
                 continue
+
             elif ".w13_weight" in name:
-                # Handle MLP gate and up projection weights
                 # Backward compat: flatten 4D [E, out, nblk, bsz//2] → 3D
                 if weight.ndim == 4:
                     weight = weight.reshape(weight.shape[0], weight.shape[1], -1)
-
                 if use_ep:
-                    narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
-                else:
-                    narrow_weight = weight[:, 2 * tp_rank_start : 2 * tp_rank_end, :]
+                    weight = weight[ep_rank_start:ep_rank_end]
+                if name not in params_dict:
+                    logger.warning(
+                        "[nvfp4] w13_weight key %r not in params_dict; "
+                        "available w13 keys: %s",
+                        name,
+                        [k for k in params_dict if "w13_weight" in k][:5],
+                    )
+                    continue
+                # w13_weight has w1 and w3 fused along dim 1: (E, 2*N, K//2).
+                # Split and load each half via weight_loader so it can apply
+                # TP sharding (via _load_w13) and any quant-method-specific logic.
+                intermediate = weight.shape[1] // 2
+                w1_weight = weight[:, :intermediate, :]
+                w3_weight = weight[:, intermediate:, :]
                 param = params_dict[name]
-                param.copy_(narrow_weight)
-
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, w1_weight, name, "w1", ep_rank_start)
+                weight_loader(param, w3_weight, name, "w3", ep_rank_start)
                 loaded_params.add(name)
                 continue
+
             elif ".w2_weight" in name:
-                # Handle MLP down projection weights
                 # Backward compat: flatten 4D → 3D
                 if weight.ndim == 4:
                     weight = weight.reshape(weight.shape[0], weight.shape[1], -1)
-
                 if use_ep:
-                    narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
-                else:
-                    narrow_weight = weight[:, :, tp_rank_start // 2 : tp_rank_end // 2]
+                    weight = weight[ep_rank_start:ep_rank_end]
+                if name not in params_dict:
+                    logger.warning(
+                        "[nvfp4] w2_weight key %r not in params_dict; "
+                        "available w2 keys: %s",
+                        name,
+                        [k for k in params_dict if "w2_weight" in k][:5],
+                    )
+                    continue
                 param = params_dict[name]
-                param.copy_(narrow_weight)
-
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, weight, name, "w2", ep_rank_start)
                 loaded_params.add(name)
                 continue
+
             elif ".w13_bias" in name:
-                # Handle MLP gate and up projection biases
-                # Extract gate and up projection bias parts
+                # FusedMoE weight_loader does not handle bias; apply TP/EP manually.
                 if use_ep:
                     narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
                 else:
                     narrow_weight = weight[:, 2 * tp_rank_start : 2 * tp_rank_end]
-
                 param = params_dict[name]
                 param.copy_(narrow_weight)
                 loaded_params.add(name)
                 continue
+
             elif ".w2_bias" in name:
-                # Handle MLP down projection bias
                 if use_ep:
                     weight = weight[ep_rank_start:ep_rank_end, ...]
                 else:
-                    # (only load on rank 0 to avoid duplication)
+                    # Only load on rank 0 to avoid duplication across TP ranks.
                     if tp_rank != 0:
                         weight.zero_()
                 param = params_dict[name]
                 param.copy_(weight)
                 loaded_params.add(name)
                 continue
+
             elif "sinks" in name:
-                # Handle attention sinks (distributed across ranks)
                 param = params_dict[name]
                 narrow_weight = weight.narrow(0, head_start, heads_per_rank)
                 param.data.copy_(narrow_weight)
                 loaded_params.add(name)
                 continue
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -1163,13 +1192,85 @@ class GptOssModel(nn.Module):
                     weight_loader(param, weight, shard_id)
                 break
             else:
-                # Handle all other weights with potential renaming
                 if name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, weight)
             loaded_params.add(name)
+
+        logger.info(
+            "[nvfp4] weight loop done: %d keys processed (first 10 samples: %s)",
+            _key_count,
+            _key_sample,
+        )
+        if _pp_skipped:
+            # Log first few PP-skipped expert keys (not all, to avoid spam).
+            expert_skipped = [
+                k
+                for k in _pp_skipped
+                if any(s in k for s in (".w13_weight", ".w2_weight"))
+            ]
+            logger.warning(
+                "[nvfp4] %d keys skipped by is_pp_missing_parameter "
+                "(%d expert-weight keys among them). "
+                "If PP=1, this is unexpected. First 10: %s",
+                len(_pp_skipped),
+                len(expert_skipped),
+                _pp_skipped[:10],
+            )
+        else:
+            logger.info("[nvfp4] No keys skipped by is_pp_missing_parameter.")
+
+        # ---- post-load diagnostics ----
+        # Log any NVFP4 expert params that were NOT loaded (silent drops = garbage).
+        nvfp4_suffixes = (
+            "w13_weight",
+            "w2_weight",
+            "w13_weight_scale",
+            "w2_weight_scale",
+            "w13_weight_scale_2",
+            "w2_weight_scale_2",
+        )
+        unloaded = [
+            k
+            for k in params_dict
+            if any(k.endswith(s) for s in nvfp4_suffixes) and k not in loaded_params
+        ]
+        if unloaded:
+            logger.warning(
+                "[nvfp4] %d NVFP4 params were NOT loaded (likely silent drop "
+                "due to missing checkpoint key or mapper mismatch):\n  %s",
+                len(unloaded),
+                "\n  ".join(sorted(unloaded)[:20]),
+            )
+        else:
+            logger.info("[nvfp4] All NVFP4 expert params loaded successfully.")
+
+        # Spot-check layer 0 scale values to catch zero/NaN corruption.
+        for suffix in (
+            "w13_weight_scale_2",
+            "w2_weight_scale_2",
+            "w13_weight_scale",
+            "w2_weight_scale",
+        ):
+            key = next(
+                (k for k in params_dict if "layers.0." in k and k.endswith(suffix)),
+                None,
+            )
+            if key and key in loaded_params:
+                v = params_dict[key].data
+                logger.info(
+                    "[nvfp4] layer0 %s: shape=%s min=%.4g max=%.4g "
+                    "has_nan=%s has_zero=%s",
+                    suffix,
+                    list(v.shape),
+                    v.float().min().item(),
+                    v.float().max().item(),
+                    bool(v.isnan().any()),
+                    bool((v == 0).all()),
+                )
+
         return loaded_params
 
     def _load_weights_other(
@@ -1344,6 +1445,15 @@ class GptOssModel(nn.Module):
             if "nvfp4" in self.config._name_or_path.lower():
                 quant_method = "nvfp4"
 
+        logger.info(
+            "[gpt_oss] load_weights: resolved quant_method=%r "
+            "(quant_config=%r, quantization_config=%r, _name_or_path=%r)",
+            quant_method,
+            self.quant_config.get_name() if self.quant_config is not None else None,
+            getattr(self.config, "quantization_config", {}).get("quant_algo"),
+            getattr(self.config, "_name_or_path", None),
+        )
+
         if quant_method == "mxfp4":
             return self._load_weights_mxfp4(
                 ep_rank_end,
@@ -1444,6 +1554,7 @@ class GptOssForCausalLM(nn.Module, SupportsPP, SupportsEagle3, SupportsLoRA):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+        self._nvfp4_fwd_diag_done = False
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         self.model.aux_hidden_state_layers = layers
@@ -1462,6 +1573,12 @@ class GptOssForCausalLM(nn.Module, SupportsPP, SupportsEagle3, SupportsLoRA):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if not self._nvfp4_fwd_diag_done:
+            self._nvfp4_fwd_diag_done = True
+            try:
+                self._log_nvfp4_kernel_config_check()
+            except Exception as _diag_err:
+                logger.warning("[nvfp4] kernel_config_check raised: %s", _diag_err)
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1473,4 +1590,185 @@ class GptOssForCausalLM(nn.Module, SupportsPP, SupportsEagle3, SupportsLoRA):
             self,
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        result = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        try:
+            self._log_nvfp4_post_load_check()
+        except Exception as _diag_err:
+            logger.warning("[nvfp4] post_load_check raised: %s", _diag_err)
+        return result
+
+    def _log_nvfp4_kernel_config_check(self) -> None:
+        """
+        Runs on the first forward call (after process_weights_after_loading).
+        Checks that every NVFP4 FusedMoE layer has a valid moe_quant_config:
+        g1_alphas, g2_alphas, a1_gscale, a2_gscale all non-zero, non-NaN.
+        """
+
+        def _fmt(t: object) -> str:
+            if t is None:
+                return "None"
+            if isinstance(t, torch.Tensor):
+                tf = t.float()
+                return (
+                    f"shape={list(t.shape)} dtype={t.dtype} "
+                    f"min={tf.min().item():.4g} max={tf.max().item():.4g} "
+                    f"has_nan={bool(tf.isnan().any())} "
+                    f"all_zero={bool((tf == 0).all())}"
+                )
+            return repr(t)
+
+        found_any = False
+        bad_layers: list[str] = []
+        good_layers: list[str] = []
+        first_moe_qc = None
+        first_moe_backend: object = "unknown"
+
+        def _bad(t: object) -> bool:
+            if not isinstance(t, torch.Tensor):
+                return t is None
+            tf = t.float()
+            return bool(tf.isnan().any()) or bool((tf == 0).all())
+
+        for name, module in self.named_modules():
+            qm = getattr(module, "quant_method", None)
+            if qm is None:
+                continue
+            moe_qc = getattr(qm, "moe_quant_config", None)
+            if moe_qc is None:
+                continue
+
+            found_any = True
+            moe_backend = getattr(qm, "nvfp4_backend", "unknown")
+            if first_moe_qc is None:
+                first_moe_qc = moe_qc
+                first_moe_backend = moe_backend
+
+            g1 = getattr(moe_qc, "g1_alphas", None)
+            g2 = getattr(moe_qc, "g2_alphas", None)
+            a1 = getattr(moe_qc, "a1_gscale", None)
+            a2 = getattr(moe_qc, "a2_gscale", None)
+
+            # a1/a2_gscale may be None for w4a16 (MARLIN) backend — not an error
+            is_bad = (
+                _bad(g1)
+                or _bad(g2)
+                or (a1 is not None and _bad(a1))
+                or (a2 is not None and _bad(a2))
+            )
+            tag = (
+                f"{name}[backend={moe_backend}]: g1_alphas={_fmt(g1)} "
+                f"| g2_alphas={_fmt(g2)} "
+                f"| a1_gscale={_fmt(a1)} | a2_gscale={_fmt(a2)}"
+            )
+            if is_bad:
+                bad_layers.append(tag)
+            else:
+                good_layers.append(name)
+
+        if not found_any:
+            logger.info("[nvfp4] kernel_config_check: no NVFP4 moe_quant_config found")
+            return
+
+        if bad_layers:
+            logger.warning(
+                "[nvfp4] KERNEL CONFIG CHECK: %d NVFP4 MoE layers have zero/NaN "
+                "kernel config (process_weights_after_loading may have failed):\n  %s\n"
+                "  (%d layers look OK)",
+                len(bad_layers),
+                "\n  ".join(bad_layers),
+                len(good_layers),
+            )
+        else:
+            g1 = getattr(first_moe_qc, "g1_alphas", None)
+            a1 = getattr(first_moe_qc, "a1_gscale", None)
+            logger.info(
+                "[nvfp4] KERNEL CONFIG CHECK: all %d NVFP4 MoE layers have valid "
+                "kernel quant config ✓ (MoE backend=%s, first layer spot-check: "
+                "g1_alphas=%s, a1_gscale=%s)",
+                len(good_layers),
+                first_moe_backend,
+                _fmt(g1),
+                _fmt(a1),
+            )
+
+    def _log_nvfp4_post_load_check(self) -> None:
+        """
+        After all weight-loading calls complete, scan every MoE layer and verify
+        NVFP4 scale_2 AND packed-weight tensors are non-zero and finite.
+        Runs after ALL AutoWeightsLoader batches so dual-call false-positives
+        from the per-call diagnostics in _load_weights_nvfp4 do not affect this.
+        """
+        bad_layers: list[str] = []
+        good_layers: list[str] = []
+        for layer_name, module in self.named_modules():
+            w13_s2 = getattr(module, "w13_weight_scale_2", None)
+            if w13_s2 is None:
+                continue
+
+            # --- w13 checks ---
+            vs13 = w13_s2.data.float()
+            w13_scale_zero = bool((vs13 == 0).all())
+            w13_scale_nan = bool(vs13.isnan().any())
+
+            w13_w = getattr(module, "w13_weight", None)
+            w13_w_zero = bool(
+                w13_w is not None and (w13_w.data.flatten()[:4096] == 0).all()
+            )
+
+            # --- w2 checks ---
+            w2_s2 = getattr(module, "w2_weight_scale_2", None)
+            w2_scale_zero = False
+            w2_scale_nan = False
+            w2_w_zero = False
+            vs2_str = "N/A"
+            if w2_s2 is not None:
+                vs2 = w2_s2.data.float()
+                w2_scale_zero = bool((vs2 == 0).all())
+                w2_scale_nan = bool(vs2.isnan().any())
+                vs2_str = f"min={vs2.min().item():.4g} max={vs2.max().item():.4g}"
+            w2_w = getattr(module, "w2_weight", None)
+            if w2_w is not None:
+                w2_w_zero = bool((w2_w.data.flatten()[:4096] == 0).all())
+
+            any_bad = (
+                w13_scale_zero
+                or w13_scale_nan
+                or w13_w_zero
+                or w2_scale_zero
+                or w2_scale_nan
+                or w2_w_zero
+            )
+            tag = (
+                f"{layer_name}["
+                f"w13_s2 shape={list(w13_s2.shape)} "
+                f"min={vs13.min().item():.4g} max={vs13.max().item():.4g} "
+                f"w13_s2_zero={w13_scale_zero} w13_s2_nan={w13_scale_nan} "
+                f"w13_w_zero={w13_w_zero} | "
+                f"w2_s2 {vs2_str} "
+                f"w2_s2_zero={w2_scale_zero} w2_s2_nan={w2_scale_nan} "
+                f"w2_w_zero={w2_w_zero}]"
+            )
+            if any_bad:
+                bad_layers.append(tag)
+            else:
+                good_layers.append(layer_name)
+
+        if not good_layers and not bad_layers:
+            # Not an NVFP4 model – no w13_weight_scale_2 parameters found.
+            return
+
+        if bad_layers:
+            logger.warning(
+                "[nvfp4] POST-LOAD CHECK: %d MoE layers have zero/NaN scale_2 "
+                "or all-zero packed weights (likely not loaded!):\n  %s\n"
+                "  (%d layers look OK)",
+                len(bad_layers),
+                "\n  ".join(bad_layers),
+                len(good_layers),
+            )
+        else:
+            logger.info(
+                "[nvfp4] POST-LOAD CHECK: all %d MoE layers have valid "
+                "non-zero w13+w2 scale_2 AND non-zero packed weights ✓",
+                len(good_layers),
+            )
