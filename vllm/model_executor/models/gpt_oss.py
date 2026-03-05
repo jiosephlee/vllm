@@ -1080,7 +1080,14 @@ class GptOssModel(nn.Module):
             elif ".w13_input_scale" in name or ".w2_input_scale" in name:
                 if name in params_dict:
                     param = params_dict[name]
-                    param.copy_(weight)
+                    # Calibration checkpoint saves [E] but vLLM creates
+                    # w13_input_scale as [E, 2] (gate + up shards).
+                    # Expand to match the param shape.
+                    if weight.ndim == 1 and param.ndim == 2:
+                        weight_to_copy = weight.unsqueeze(1).expand_as(param)
+                    else:
+                        weight_to_copy = weight
+                    param.copy_(weight_to_copy)
                     loaded_params.add(name)
                 continue
             elif ".w13_weight" in name:

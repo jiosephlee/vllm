@@ -31,7 +31,7 @@ Then run the benchmarking script
 export MODEL_PATH=/models/meta-llama/Meta-Llama-3.1-8B-Instruct/
 
 python benchmark_serving_multi_turn.py --model $MODEL_PATH --served-model-name Llama \
---input-file generate_multi_turn.json --num-clients 2 --max-active-conversations 6
+--input-file generate_multi_turn.json --num-clients 1 --max-active-conversations 6
 ```
 
 You can edit the file `generate_multi_turn.json` to change the conversation parameters (number of turns, etc.).
