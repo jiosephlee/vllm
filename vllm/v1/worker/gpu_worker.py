@@ -199,7 +199,12 @@ class Worker(WorkerBase):
             self.model_runner.init_fp8_kv_scales()
 
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
-        if self.vllm_config.model_config.enable_sleep_mode:
+        sleep_enabled = self.vllm_config.model_config.enable_sleep_mode
+        logger.info(
+            "[_maybe_get_memory_pool_context] tag=%s, enable_sleep_mode=%s",
+            tag, sleep_enabled,
+        )
+        if sleep_enabled:
             from vllm.device_allocator.cumem import CuMemAllocator
 
             allocator = CuMemAllocator.get_instance()
